@@ -1,0 +1,268 @@
+#include <WiFi.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+
+#include <Wire.h>
+#include <MPU6050.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <DFRobotDFPlayerMini.h>
+
+HardwareSerial dfSerial(2);
+
+#define RXD2 16
+#define TXD2 17
+
+DFRobotDFPlayerMini dfplayer;
+
+// WIFI
+const char* ssid = "ASA";
+const char* password = "123456798";
+
+AsyncWebServer server(80);
+
+// OLED
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 32
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// MPU
+MPU6050 mpu;
+
+// FLEX
+int flex1 = 34;
+int flex2 = 35;
+
+// BUZZER
+#define BUZZER_PIN 25
+bool emergencyActive = false;
+
+// Calibration
+int f1_base = 0;
+int f2_base = 0;
+
+// OFFSETS
+int offset1 = 10;
+int offset2 = 15;
+
+// Filter
+float f1_filtered = 0;
+float f2_filtered = 0;
+float alpha = 0.2;
+
+// Stability
+String lastMessage = "";
+int stableCount = 0;
+
+// Message tracking
+String currentMessage = "I AM FINE";
+String lastPlayedMessage = "";
+
+// NON-BLOCKING TIMER
+unsigned long lastReadTime = 0;
+const int interval = 50;
+
+// SSE for instant updates
+AsyncEventSource events("/events");
+
+// ---------- BEAUTIFUL WEB PAGE ----------
+String getHTML() {
+  String html = "<!DOCTYPE html><html><head>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+  html += "<title>Hand Gesture Vocalizer</title>";
+
+  html += "<style>";
+  html += "body{margin:0;padding:0;font-family:'Segoe UI',Arial,sans-serif;";
+  html += "background:linear-gradient(135deg,#0f0c29,#302b63,#24243e);";
+  html += "color:white;text-align:center;overflow:hidden;height:100vh;";
+  html += "display:flex;flex-direction:column;justify-content:center;align-items:center;}";
+  
+  html += "h1{font-size:42px;font-weight:700;margin:0 0 10px 0;letter-spacing:2px;";
+  html += "text-shadow:0 0 20px rgba(255,255,255,0.3);}";
+  
+  html += ".subtitle{font-size:18px;color:#a0a0ff;margin-bottom:30px;opacity:0.9;}";
+  
+  // Distinct Purple Box
+  html += "#container{background:rgba(90, 50, 180, 0.85);backdrop-filter:blur(12px);";
+  html += "border-radius:25px;padding:40px 30px;width:90%;max-width:460px;";
+  html += "border:2px solid rgba(140, 100, 255, 0.6);box-shadow:0 15px 40px rgba(0,0,0,0.7);}";
+  
+  html += "#msg{font-size:68px;font-weight:800;margin:20px 0;min-height:110px;";
+  html += "display:flex;align-items:center;justify-content:center;transition:all 0.4s ease;";
+  html += "border-radius:20px;padding:15px 10px;text-shadow:0 0 25px rgba(255,255,255,0.5);}";
+  
+  html += ".status-dot{display:inline-block;width:18px;height:18px;background:#00ff88;";
+  html += "border-radius:50%;animation:pulse 2s infinite;margin-right:10px;vertical-align:middle;}";
+  
+  html += "@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(0,255,136,0.7);}";
+  html += "70%{box-shadow:0 0 0 15px rgba(0,255,136,0);}100%{box-shadow:0 0 0 0 rgba(0,255,136,0);}}";
+  
+  // Emergency Effect
+  html += ".emergency #msg{background:#ff0033;color:white;animation:emergencyFlash 0.6s infinite alternate;";
+  html += "text-shadow:0 0 30px #ff0033;}";
+  html += "@keyframes emergencyFlash{from{box-shadow:0 0 30px #ff0033;}to{box-shadow:0 0 60px #ff6666;}}";
+  
+  html += "footer{margin-top:40px;font-size:14px;opacity:0.8;}";
+  html += "</style>";
+
+  // SSE Instant Update
+  html += "<script>";
+  html += "const eventSource = new EventSource('/events');";
+  html += "eventSource.onmessage = function(e) {";
+  html += "  const msgDiv = document.getElementById('msg');";
+  html += "  const body = document.body;";
+  html += "  msgDiv.innerHTML = e.data;";
+  html += "  if(e.data === 'EMERGENCY'){";
+  html += "    body.classList.add('emergency');";
+  html += "  } else {";
+  html += "    body.classList.remove('emergency');";
+  html += "  }";
+  html += "};";
+  html += "</script></head>";
+
+  html += "<body>";
+  
+  html += "<div id='container'>";
+  html += "  <h1><span class='status-dot'></span>HAND GESTURE VOCALIZER</h1>";
+  html += "  <div class='subtitle'>Real-time Gesture Recognition System</div>";
+  
+  html += "  <div id='msg'>" + currentMessage + "</div>";
+  html += "</div>";
+  
+  html += "<footer>ESP32 • Live • " + WiFi.localIP().toString() + "</footer>";
+
+  html += "</body></html>";
+
+  return html;
+}
+
+void handleRoot(AsyncWebServerRequest *request) {
+  request->send(200, "text/html", getHTML());
+}
+
+// ---------- FUNCTIONS ----------
+int readFlex(int pin) {
+  return analogRead(pin);
+}
+
+void showMessage(String msg) {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(2);
+  display.setCursor(0, 0);
+  display.println(msg);
+  display.display();
+}
+
+// ---------- SETUP ----------
+void setup() {
+  Serial.begin(115200);
+
+  Wire.begin(21, 22);
+  Wire.setClock(100000);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+  showMessage("Connecting");
+
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(300);
+    Serial.print(".");
+  }
+
+  Serial.println("\nIP: " + WiFi.localIP().toString());
+  showMessage(WiFi.localIP().toString());
+
+  // Web Server
+  server.on("/", HTTP_GET, handleRoot);
+  
+  events.onConnect([](AsyncEventSourceClient *client){
+    client->send(currentMessage.c_str(), "message", millis());
+  });
+  server.addHandler(&events);
+
+  server.begin();
+
+  delay(1500);
+
+  // Calibration
+  f1_base = readFlex(flex1);
+  f2_base = readFlex(flex2);
+  f1_filtered = f1_base;
+  f2_filtered = f2_base;
+
+  showMessage("READY");
+
+  mpu.initialize();
+
+  dfSerial.begin(9600, SERIAL_8N1, RXD2, TXD2);
+  dfplayer.begin(dfSerial);
+  dfplayer.volume(30);
+}
+
+// ---------- LOOP ----------
+void loop() {
+  if (millis() - lastReadTime > interval) {
+    lastReadTime = millis();
+
+    int raw1 = readFlex(flex1);
+    int raw2 = readFlex(flex2);
+
+    f1_filtered = alpha * raw1 + (1 - alpha) * f1_filtered;
+    f2_filtered = alpha * raw2 + (1 - alpha) * f2_filtered;
+
+    bool f1_bent = (f1_filtered < (f1_base - offset1));
+    bool f2_bent = (f2_filtered < (f2_base - offset2));
+
+    int16_t ax, ay, az;
+    mpu.getAcceleration(&ax, &ay, &az);
+
+    String message = "I AM FINE";
+
+    if (f1_bent && !f2_bent) message = "NEED WATER";
+    else if (!f1_bent && f2_bent) message = "NEED FOOD";
+    else if (f1_bent && f2_bent) message = "EMERGENCY";
+    else {
+      if (ax < -9000) message = "LIGHT";
+      else if (ax > 9000) message = "FAN";
+      else if (ay > 9000) message = "WASHROOM";
+    }
+
+    if (message == lastMessage) stableCount++;
+    else stableCount = 0;
+
+    if (stableCount >= 3) {
+
+      showMessage(message);
+
+      if (message != currentMessage) {
+        currentMessage = message;
+        events.send(currentMessage.c_str(), "message", millis());
+      }
+
+      if (message != lastPlayedMessage) {
+        playVoice(message);
+        lastPlayedMessage = message;
+        emergencyActive = (message == "EMERGENCY");
+      }
+
+      stableCount = 0;
+    }
+
+    lastMessage = message;
+    digitalWrite(BUZZER_PIN, emergencyActive ? HIGH : LOW);
+  }
+}
+
+// ---------- VOICE ----------
+void playVoice(String msg) {
+  if (msg == "NEED WATER") dfplayer.playMp3Folder(1);
+  else if (msg == "NEED FOOD") dfplayer.playMp3Folder(2);
+  else if (msg == "EMERGENCY") dfplayer.playMp3Folder(3);
+  else if (msg == "LIGHT") dfplayer.playMp3Folder(4);
+  else if (msg == "FAN") dfplayer.playMp3Folder(5);
+  else if (msg == "WASHROOM") dfplayer.playMp3Folder(6);
+}
