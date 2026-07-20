@@ -1,0 +1,33 @@
+
+# Componentys required 
+  ESP32 Development Board
+  2 × Flex Sensors
+  MPU6050 Accelerometer & Gyroscope Sensor
+  0.96" OLED Display (SSD1306, I2C)
+  DFPlayer Mini MP3 Module
+  MicroSD Card
+  Speaker (3W/4Ω)
+  Active Buzzer
+  Breadboard
+  Jumper Wires
+  USB Cable
+  5V Power Supply
+
+
+
+# Required Libraries  
+  WiFi
+  AsyncTCP
+  ESPAsyncWebServer
+  Wire
+  MPU6050
+  Adafruit GFX Library
+  Adafruit SSD1306
+  DFRobotDFPlayerMini
+
+#software used
+  Arduino IDE
+  ESP32 Board Package (by Espressif Systems)
+  Git
+  GitHub
+  Google Chrome (or any modern web browser)
